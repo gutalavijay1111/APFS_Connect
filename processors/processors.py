@@ -38,18 +38,21 @@ bikes_inventory = {
     }
 }
 
-data_store = {}
+
+def _registry():
+    from setup import temp_registry
+    return temp_registry
+
 
 def process_test_ride(payload):
-    bike_id = payload.get("id")
     user_id = payload.get("user_id")
     customer_want_test_ride = payload.get("value", "")
 
     if customer_want_test_ride:
         send_text_message(user_id, "Get ready for a Test Ride. 🚀")
-        return
-    
-    send_text_message(user_id, "Sorry to see you go 🥺")
+    else:
+        send_text_message(user_id, "Sorry to see you go 🥺")
+
 
 def process_bike_selection(payload):
     bike_id = payload.get("id")
@@ -60,47 +63,51 @@ def process_bike_selection(payload):
         send_text_message(user_id, "Sorry, the selected bike is not available.")
         return
 
-    bike_image = bike_data.pop("image", "")
-    details = "\n".join([f"*{detail.upper()}*: {bike_data.get(detail)}" for detail in bike_data])
+    # Work on a copy so bikes_inventory is never mutated
+    bike_copy  = dict(bike_data)
+    bike_image = bike_copy.pop("image", "")
+    details    = "\n".join(f"*{k.upper()}*: {v}" for k, v in bike_copy.items())
 
     send_media_message(
         phone_number=user_id,
         media_type="image",
         link=bike_image,
-        caption=details
+        caption=details,
     )
 
 
 def process_location_selection(payload):
-    user_id = payload.get("user_id")
-    selected_location = payload.get("value", "Unknown Location")
+    user_id  = payload.get("user_id")
+    location = payload.get("value", "")
 
-    if selected_location == "Unknown Location":
+    if not location:
         send_text_message(user_id, "Invalid location selected. Please try again.")
         return
 
-    # Save location temporarily for the user
-    data_store[user_id] = {"location": selected_location}
-    send_text_message(user_id, f"Location selected: {selected_location}. Please choose a time slot.")
+    # Persist to Redis so it's visible across gunicorn workers
+    _registry().set_user_data(user_id, "booking_location", location)
+    send_text_message(user_id, f"📍 Location: *{location}*. Now choose a time slot.")
 
 
 def process_time_slot_selection(payload):
-    user_id = payload.get("user_id")
-    selected_time_slot = payload.get("value", "Unknown Time Slot")
+    user_id   = payload.get("user_id")
+    time_slot = payload.get("value", "")
 
-    if selected_time_slot == "Unknown Time Slot":
+    if not time_slot:
         send_text_message(user_id, "Invalid time slot selected. Please try again.")
         return
 
-    user_data = data_store.pop(user_id, {})
-    location = user_data.get("location", "Unknown Location")
+    location = _registry().get_user_data(user_id, "booking_location")
+    _registry().delete_user_data(user_id, "booking_location")
 
-    if location == "Unknown Location":
-        send_text_message(user_id, "Location information is missing. Please restart the booking process.")
+    if not location:
+        send_text_message(user_id, "Location info is missing. Please restart with /test_ride.")
         return
 
-    confirmation_message = f"Your booking has been confirmed at {location} on {selected_time_slot}."
-    send_text_message(user_id, confirmation_message)
+    send_text_message(
+        user_id,
+        f"✅ Test ride confirmed!\n📍 *{location}*\n🕐 *{time_slot}*\n\nSee you there!"
+    )
 
 
 
