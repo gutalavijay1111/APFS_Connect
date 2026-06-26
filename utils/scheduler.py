@@ -1,3 +1,4 @@
+import os
 import pytz
 
 from uuid import uuid4
@@ -12,10 +13,12 @@ from batch_processor.batch_processor import BatchProcessor
 log_manager = LogManager()
 logger = log_manager.get_logger("scheduler")
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/10")
+
 celery_app = Celery(
     'scheduler',
-    broker='redis://localhost:6379/10',
-    backend='redis://localhost:6379/10',
+    broker=REDIS_URL,
+    backend=REDIS_URL,
 )
 celery_app.conf.update(
     result_expires=3600,

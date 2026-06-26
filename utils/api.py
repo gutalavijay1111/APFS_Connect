@@ -36,7 +36,7 @@ def send_error(resp, error_message="An error occurred", error_code: status_codes
             "traceback": traceback.format_exc()
         }
         if MODE != "DEBUG":
-            response_body.pop("traceback")
+            response_body["exception"].pop("traceback", None)
 
     resp.media = response_body
     resp.status = error_code
