@@ -849,18 +849,16 @@ app.add_route("/apfsconnect/api/analytics/remainders/users/{id}", RemaindersUser
 # app.add_route("/promotions/{promotion_id}", PromotionResource())
 
 
-# class CORSMiddleware:
-#     def process_request(self, req, resp):
-#         # Add headers for preflight and actual requests
-#         resp.set_header("Access-Control-Allow-Origin", "*")
-#         resp.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-#         resp.set_header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, X-Requested-With X-File-Name")
+class CORSMiddleware:
+    def process_request(self, req, resp):
+        resp.set_header("Access-Control-Allow-Origin", "*")
+        resp.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        resp.set_header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, X-Requested-With, X-File-Name")
 
-#         # Allow browsers to cache the preflight response
-#         if req.method == "OPTIONS":
-#             resp.status = falcon.HTTP_200
-#             return
-        
+        if req.method == "OPTIONS":
+            resp.status = falcon.HTTP_200
+            return
+
 
 import falcon
 from utils.logger import LogManager
@@ -870,16 +868,29 @@ from api_resources.campaigns import CampaignResource
 from api_resources.promotions import PromotionResource
 from api_resources.remainders import RemainderResource
 from api_resources.jobs import JobResource
+from api_resources.simulator import (
+    SimulatorContactResource,
+    SimulatorContactDetailResource,
+    SimulatorMessageResource,
+    SimulatorSendResource,
+)
+from api_resources.flow_builder import FlowFileResource, FlowGenerateResource, UploadServeResource
 
 log_manager = LogManager()
 logger = log_manager.get_logger("server")
 
-app = falcon.App(middleware=[MultipartMiddleware()])
+app = falcon.App(middleware=[MultipartMiddleware(), CORSMiddleware()])
 app.req_options.media_handlers.update({
     "application/json": falcon.media.JSONHandler(),
 })
 
 # Whatsapp Webhook
+class HealthResource:
+    def on_get(self, req, resp):
+        resp.media = {"status": "ok"}
+        resp.status = falcon.HTTP_200
+
+app.add_route('/health', HealthResource())
 app.add_route('/whatsapp', WhatsAppWebhook())
 app.add_route("/apfsconnect/api/overview", analytics, suffix="overview")
 # Promotions endpoints
@@ -918,6 +929,17 @@ app.add_route("/apfsconnect/api/upload", file_upload_resource)
 
 job_resource = JobResource()
 app.add_route("/apfsconnect/api/jobs", job_resource)
+
+# Simulator endpoints (channel-agnostic chat simulator)
+app.add_route("/apfsconnect/api/simulator/contacts", SimulatorContactResource())
+app.add_route("/apfsconnect/api/simulator/contacts/{phone}", SimulatorContactDetailResource())
+app.add_route("/apfsconnect/api/simulator/messages/{phone}", SimulatorMessageResource())
+app.add_route("/apfsconnect/api/simulator/send", SimulatorSendResource())
+
+# Flow Builder endpoints (save JSON to disk, AI generation, uploads)
+app.add_route("/apfsconnect/api/flows/file", FlowFileResource())
+app.add_route("/apfsconnect/api/flows/generate", FlowGenerateResource())
+app.add_route("/apfsconnect/api/uploads/{filename}", UploadServeResource())
 
 if __name__ == "__main__":
     from wsgiref.simple_server import make_server
