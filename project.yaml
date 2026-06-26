@@ -1,0 +1,424 @@
+project:
+  name: "NexComm — Real-Time Communication Platform"
+  goal: "SDE3 portfolio project showcasing distributed systems depth"
+  local_only: true
+  cost: "$0 (all services run via Docker Compose)"
+
+# ──────────────────────────────────────────────
+# PHASE 1 — Foundation
+# ──────────────────────────────────────────────
+phase_1:
+  name: "Foundation & Infrastructure"
+  goal: "Repo scaffold, Docker Compose stack, CI pipeline, data models"
+
+  tasks:
+    repo_setup:
+      - Monorepo scaffold (pnpm workspaces or Turborepo)
+      - Git hooks (Husky + lint-staged)
+      - ESLint + Prettier + TypeScript strict config
+      - GitHub Actions CI (lint → test → build)
+      - Docker Compose base stack (all backing services)
+
+    data_modeling:
+      postgres:
+        tables:
+          - users (id, username, email, avatar_url, created_at)
+          - channels (id, name, type[dm|group|broadcast], created_at)
+          - channel_members (channel_id, user_id, role, joined_at)
+          - audit_log (id, actor_id, action, resource, metadata, created_at)
+      mongodb:
+        collections:
+          - messages (id, channel_id, sender_id, type[text|audio|video|file], content, idempotency_key, vector_clock, created_at)
+          - media_metadata (id, message_id, url, mime_type, size, duration)
+      redis:
+        keyspaces:
+          - "presence:{user_id}" → online/offline/typing TTL
+          - "session:{token}" → JWT session cache
+          - "ratelimit:{user_id}:{window}" → token bucket counters
+          - "cache:top_users" → leaderboard sorted set
+      elasticsearch:
+        indices:
+          - messages_index (channel_id, content, sender, timestamp)
+          - users_index (username, display_name)
+
+    api_design:
+      style: REST + WebSocket (ws://)
+      auth_header: "Authorization: Bearer <JWT>"
+      versioning: "/api/v1/..."
+      idempotency: "Idempotency-Key header on POST /messages"
+      key_endpoints:
+        - "POST   /api/v1/auth/login"
+        - "POST   /api/v1/auth/refresh"
+        - "GET    /api/v1/users/:id"
+        - "POST   /api/v1/channels"
+        - "GET    /api/v1/channels/:id/messages"
+        - "POST   /api/v1/channels/:id/messages"
+        - "POST   /api/v1/media/upload"
+        - "GET    /api/v1/search?q=&type=messages|users"
+        - "WS     /ws  (upgrade handshake)"
+
+# ──────────────────────────────────────────────
+# PHASE 2 — Core Real-Time Services
+# ──────────────────────────────────────────────
+phase_2:
+  name: "Core Real-Time Services"
+  goal: "WebSocket hub, messaging, presence, typing indicators"
+
+  services:
+    websocket_service:
+      runtime: Node.js (uWebSockets.js or ws)
+      responsibilities:
+        - Client connection registry (in-memory + Redis)
+        - Pub-Sub fan-out via Redis channels
+        - Typing indicator events (debounced, TTL 3s)
+        - Presence heartbeat (ping/pong every 30s)
+        - Broadcasting to channel subscribers
+      events:
+        client_to_server:
+          - "message.send"
+          - "typing.start"
+          - "typing.stop"
+          - "presence.update"
+        server_to_client:
+          - "message.new"
+          - "message.delivered"
+          - "typing.indicator"
+          - "presence.changed"
+          - "top_users.update"
+
+    messaging_service:
+      runtime: Node.js / Go
+      responsibilities:
+        - Idempotency key deduplication (Redis, 24h TTL)
+        - Vector clock assignment per message
+        - Persist to MongoDB
+        - Publish to Kafka topic "messages.raw"
+        - Dead letter queue handling on publish failure
+      guarantees:
+        - Exactly-once write via idempotency key
+        - Causal ordering via vector clocks
+
+    auth_service:
+      runtime: Node.js
+      responsibilities:
+        - Local user/password login
+        - SSO via OIDC (mock with Keycloak Docker)
+        - JWT issuance (15min access / 7d refresh)
+        - Token rotation on refresh
+        - Bloom filter for username availability check
+      libraries:
+        - "jose (JWT)"
+        - "bloomfilter.js"
+        - "openid-client (OIDC)"
+
+# ──────────────────────────────────────────────
+# PHASE 3 — Media & Search
+# ──────────────────────────────────────────────
+phase_3:
+  name: "Media Support & Search"
+  goal: "Audio/video/file upload, CDN simulation, full-text search"
+
+  services:
+    media_service:
+      runtime: Node.js
+      responsibilities:
+        - Chunked upload to MinIO (S3-compatible, local Docker)
+        - ffmpeg transcoding for audio/video (720p cap)
+        - Pre-signed URL generation (mock CDN via Nginx)
+        - Media metadata write to MongoDB
+      supported_types:
+        - audio (mp3, ogg, webm)
+        - video (mp4, webm)
+        - files (pdf, zip, images)
+      mock_cdn:
+        tool: Nginx reverse proxy
+        note: "Simulates CDN caching headers (Cache-Control, ETag, Expires)"
+
+    search_service:
+      tool: Elasticsearch (Docker)
+      responsibilities:
+        - Full-text message search within channel
+        - Fuzzy username search
+        - Index updates via Kafka consumer
+      features:
+        - Highlighted snippets in results
+        - Paginated cursor-based results
+
+# ──────────────────────────────────────────────
+# PHASE 4 — Data Pipeline & Analytics
+# ──────────────────────────────────────────────
+phase_4:
+  name: "Data Pipeline & Real-Time Analytics"
+  goal: "Ingest → process → analyze message stream, real-time leaderboard"
+
+  pipeline:
+    ingest:
+      tool: Kafka (Redpanda Docker — zero-JVM, lighter)
+      topics:
+        - "messages.raw"       # every message sent
+        - "presence.events"    # joins/leaves/typing
+        - "media.uploads"      # upload completions
+        - "dlq.messages"       # dead letter queue
+
+    process:
+      tool: "Node.js stream processor (or Apache Flink local)"
+      windowed_aggregations:
+        - Messages per user per 1-minute tumbling window
+        - Active users per channel per 5-minute window
+        - Message type breakdown (text vs media) hourly
+      outputs:
+        - Updates Redis sorted set "top_users" (leaderboard)
+        - Writes aggregates to TimescaleDB / Postgres
+
+    analyze:
+      analytics_service:
+        responsibilities:
+          - Serve real-time top users via WebSocket push
+          - REST endpoint for historical analytics
+          - Backpressure: drop oldest event if queue depth > 10k
+        endpoints:
+          - "GET /api/v1/analytics/top-users?window=1m|5m|1h"
+          - "GET /api/v1/analytics/channel/:id/activity"
+
+# ──────────────────────────────────────────────
+# PHASE 5 — Bots & Simulation
+# ──────────────────────────────────────────────
+phase_5:
+  name: "Automated Users & Load Simulation"
+  goal: "Simulate realistic traffic, stress-test the system"
+
+  bot_simulation_service:
+    runtime: Node.js
+    behavior:
+      - N configurable bot users (default 50)
+      - Random message cadence (Poisson distribution)
+      - Random channel joins/leaves
+      - Occasional media upload simulation
+      - Typing indicator emission before sending
+    config:
+      - bot_count: 50
+      - messages_per_minute_per_bot: 0.5–5 (random)
+      - active_hours_simulation: true
+
+  load_generator:
+    tool: k6 (free, runs locally)
+    scenarios:
+      smoke_test:
+        vus: 10
+        duration: "1m"
+      load_test:
+        vus: 500
+        duration: "5m"
+      stress_test:
+        vus: 2000
+        duration: "10m"
+        note: "Find breaking point, record p50/p95/p99 latency"
+      spike_test:
+        vus: 0→5000→0
+        duration: "2m"
+    metrics_to_track:
+      - WebSocket connection time
+      - Message delivery latency (send → received by other client)
+      - API p99 response time
+      - Error rate under load
+
+# ──────────────────────────────────────────────
+# PHASE 6 — Resilience & Security
+# ──────────────────────────────────────────────
+phase_6:
+  name: "Resilience, Security & Advanced Patterns"
+  goal: "Production-grade patterns that impress SDE3 interviewers"
+
+  rate_limiting:
+    algorithm: Token bucket (sliding window)
+    implementation: Redis + custom middleware
+    limits:
+      - messages: 60/min per user
+      - media_uploads: 10/min per user
+      - api_calls: 300/min per IP
+
+  circuit_breaker:
+    tool: "opossum (Node.js)"
+    applied_to:
+      - Messaging service → Kafka publish
+      - Media service → MinIO
+      - Auth service → Keycloak OIDC
+    behavior:
+      - Open after 5 consecutive failures
+      - Half-open probe after 30s
+      - Fallback: queue locally, retry on close
+
+  e2e_encryption:
+    scope: Direct messages only
+    protocol: "Simplified Signal (X3DH key exchange)"
+    library: "libsodium-wrappers"
+    note: "Keys never leave client; server stores only ciphertext"
+
+  vector_clocks:
+    scope: All messages in a channel
+    purpose: Causal ordering without central timestamp authority
+    implementation: Custom JS class, stored as JSON in MongoDB
+
+  dead_letter_queue:
+    topic: "dlq.messages"
+    triggers:
+      - Kafka publish fails after 3 retries
+      - Downstream consumer throws unhandled error
+    handling: Admin UI shows DLQ depth, manual replay button
+
+  chaos_engineering:
+    tool: "Custom Docker Compose kill scripts"
+    scenarios:
+      - Kill messaging service → verify circuit breaker opens
+      - Kill Kafka → verify DLQ accumulates, replays on restart
+      - Kill Redis → verify graceful degradation (no cache, still functional)
+      - Network partition (tc netem) → verify reconnect logic
+    dashboard: Grafana panel showing recovery time per scenario
+
+# ──────────────────────────────────────────────
+# PHASE 7 — Observability
+# ──────────────────────────────────────────────
+phase_7:
+  name: "Observability Stack"
+  goal: "Full visibility into the system — traces, metrics, logs, alerts"
+
+  distributed_tracing:
+    tool: OpenTelemetry SDK + Jaeger (Docker)
+    instrumented:
+      - All HTTP handlers (auto-instrument)
+      - WebSocket message flow
+      - Kafka produce/consume spans
+      - DB queries (pg, mongoose)
+    propagation: W3C TraceContext headers
+
+  metrics:
+    tool: Prometheus + Grafana (Docker)
+    dashboards:
+      - "System health" (CPU, memory, connections)
+      - "Message throughput" (msg/s, latency heatmap)
+      - "Top users leaderboard" (live)
+      - "Pipeline lag" (Kafka consumer lag)
+      - "Error rates" (by service, by error type)
+    alerts:
+      - p99 latency > 500ms for 2min
+      - Kafka consumer lag > 10k messages
+      - DLQ depth > 100
+
+  structured_logging:
+    tool: "Pino (Node.js) → stdout → Loki (Docker) → Grafana"
+    fields_on_every_log:
+      - trace_id
+      - span_id
+      - service
+      - user_id (if authenticated)
+      - correlation_id (request-scoped)
+
+  audit_log:
+    storage: PostgreSQL audit_log table
+    events:
+      - user.login / user.logout
+      - message.delete (admin)
+      - channel.create / channel.delete
+      - media.upload
+    properties:
+      - Append-only (no UPDATE/DELETE on this table)
+      - Indexed on actor_id + created_at
+
+# ──────────────────────────────────────────────
+# PHASE 8 — Frontend
+# ──────────────────────────────────────────────
+phase_8:
+  name: "Frontend Client"
+  goal: "Demonstrate the platform end-to-end visually"
+
+  stack:
+    framework: React + TypeScript + Vite
+    state: Zustand (lightweight)
+    websocket: native WebSocket API with reconnect logic
+    styling: Tailwind CSS
+
+  features:
+    - Channel list + DM list sidebar
+    - Message thread with infinite scroll (cursor pagination)
+    - Typing indicator ("Alice is typing…")
+    - Presence badges (online/offline/away)
+    - Media upload with progress bar
+    - Real-time top users leaderboard widget
+    - Analytics mini-dashboard (messages/hour chart)
+    - Bot activity toggle (start/stop bots from UI)
+    - Chaos panel (kill/restart services from UI for demo)
+
+# ──────────────────────────────────────────────
+# LOCAL INFRASTRUCTURE (Docker Compose)
+# ──────────────────────────────────────────────
+infrastructure:
+  all_services_local: true
+  docker_compose_services:
+    postgres:
+      image: "postgres:16-alpine"
+      note: "Users, channels, audit log"
+    mongodb:
+      image: "mongo:7"
+      note: "Messages, media metadata"
+    redis:
+      image: "redis:7-alpine"
+      note: "Cache, sessions, pub-sub, rate limiting"
+    redpanda:
+      image: "redpandadata/redpanda:latest"
+      note: "Kafka-compatible, no JVM — message queue + DLQ"
+    elasticsearch:
+      image: "elasticsearch:8.13.0"
+      note: "Full-text search"
+    minio:
+      image: "minio/minio"
+      note: "S3-compatible local object storage for media"
+    keycloak:
+      image: "quay.io/keycloak/keycloak:24"
+      note: "OIDC/SSO provider (mock identity provider)"
+    jaeger:
+      image: "jaegertracing/all-in-one:1.57"
+      note: "Distributed traces UI"
+    prometheus:
+      image: "prom/prometheus:v2.51.0"
+    grafana:
+      image: "grafana/grafana:10.4.0"
+      note: "Metrics + logs dashboards"
+    loki:
+      image: "grafana/loki:3.0.0"
+      note: "Log aggregation"
+    nginx:
+      image: "nginx:alpine"
+      note: "Mock CDN with cache headers for media delivery"
+
+# ──────────────────────────────────────────────
+# OPTIMIZATIONS CHECKLIST
+# ──────────────────────────────────────────────
+optimizations:
+  implemented:
+    - Response caching (Redis, TTL-based, cache-aside pattern)
+    - CDN simulation (Nginx Cache-Control + ETag headers)
+    - Bloom filter for username checks (avoid DB round-trip)
+    - Connection pooling (pg-pool, Mongoose pool)
+    - Cursor-based pagination (no OFFSET scans)
+    - Kafka consumer batching (process 100 msgs at a time)
+    - WebSocket message batching (flush every 16ms, ~60fps)
+    - Lazy media transcoding (queue job, return URL immediately)
+    - Index strategy documented per collection/table
+
+  to_document:
+    - Capacity estimates (back-of-envelope math in README)
+    - Bottleneck analysis from k6 stress test results
+    - Schema migration strategy (zero-downtime via expand-contract)
+
+# ──────────────────────────────────────────────
+# BUILD ORDER (suggested sequence)
+# ──────────────────────────────────────────────
+build_order:
+  - phase_1   # Foundation — everything depends on this
+  - phase_2   # Core services — real-time backbone
+  - phase_4   # Pipeline — needed before analytics work
+  - phase_5   # Bots — generates traffic for pipeline
+  - phase_3   # Media — adds richness, parallelizable
+  - phase_7   # Observability — instrument as you build
+  - phase_6   # Resilience — harden once core works
+  - phase_8   # Frontend — wire it all together visually
