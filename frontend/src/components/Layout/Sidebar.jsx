@@ -11,6 +11,7 @@ const Sidebar = () => {
     { label: "Campaigns", path: "/campaigns", icon: "📊" },
     { label: "Flows", path: "/flows", icon: "📜" },
     { label: "Flow Builder", path: "/flow_builder", icon: "🧰" },
+    { label: "Simulator", path: "/simulator", icon: "📱" },
   ];
 
   const toggleSidebar = () => {

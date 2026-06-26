@@ -26,6 +26,7 @@ import SignUp from "./pages/SignUpPage";
 import Login from "./pages/LoginPage";
 
 import FlowBuilderPage from "./pages/FlowBuilderPage";
+import SimulatorPage from "./pages/SimulatorPage";
 
 const App = () => {
   return (
@@ -51,6 +52,7 @@ const App = () => {
         <Route path="/remainders/users/:id" element={<RemaindersUserDetailsPage />} />
         <Route path="/users/:id" element={<UserDetailsPage />} />
         <Route path="/flow_builder" element={<FlowBuilderPage />} />
+        <Route path="/simulator" element={<SimulatorPage />} />
       </Routes>
     </Router>
   );

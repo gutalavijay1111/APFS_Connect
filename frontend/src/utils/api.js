@@ -1,7 +1,7 @@
 import axios from 'axios';
 
-const apiClient = axios.create({
-  baseURL: 'https://apfs.loan2wheels.com/apfsconnect/api', 
+export const apiClient = axios.create({
+  baseURL: process.env.REACT_APP_API_BASE_URL || 'http://localhost:9999/apfsconnect/api',
 });
 
 export const fetchOverview = () => apiClient.get('/overview');
