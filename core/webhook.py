@@ -90,27 +90,46 @@ class WhatsAppWebhook:
 
     def handle_text_message(self, user_id: str, message: Dict, resp: falcon.Response) -> None:
 
-        text = message.get("text", {}).get("body", "").lower()
+        text = message.get("text", {}).get("body", "").lower().strip()
         fresh_flow = global_registry.get_flow_by_trigger(text)
         resume_from_step = temp_registry.get_user_current_step(user_id)
         flow_id = temp_registry.get_user_current_flow(user_id)
-        
+
         if fresh_flow:
+            # User explicitly triggered a new flow — abandon any current session
+            if flow_id:
+                logger.info(f"User '{user_id}' abandoned flow '{flow_id}' to start '{fresh_flow['id']}'.")
+            temp_registry.clear_user_state(user_id)
             resume_from_step = {}
             flow_id = fresh_flow["id"]
-            temp_registry.clear_user_state(user_id)
-            logger.info(f"Triggering flow: {flow_id} for user: {user_id}")
+            logger.info(f"Triggering flow '{flow_id}' for user '{user_id}'.")
+
+        elif temp_registry.user_has_pending_step(user_id):
+            # User has a pending interactive step — text input is not a valid response here.
+            # Only allow it through if the pending step's content is text-based (not interactive).
+            pending_step = temp_registry.get_user_current_step(user_id)
+            pending_content_type = (pending_step.get("content") or {}).get("type", "text")
+            if pending_content_type == "interactive":
+                send_text_message(
+                    user_id,
+                    "👆 Please use the options above to continue.\n\n"
+                    "Or type a command (e.g. /help) to start a new conversation."
+                )
+                resp.status = falcon.HTTP_200
+                resp.media = {"message": "Pending interactive step — text ignored."}
+                return
+            # Text-collection step: fall through and resume normally
 
         if not flow_id:
-            logger.warning(f"No flow found for trigger: {text}, user: {user_id}")
-            send_text_message(user_id, "Sorry, no matching flow found. Please try again.")
+            logger.warning(f"No flow found for trigger: '{text}', user: '{user_id}'.")
+            send_text_message(user_id, "I didn't understand that. Type /help to see available commands.")
             resp.status = falcon.HTTP_200
             resp.media = {"message": "No matching flow found."}
             return
 
         execute_flow(user_id, flow_id, resume_from_step, {"user_response": text})
         resp.status = falcon.HTTP_200
-        resp.media = {"message": f"Flow {flow_id} triggered successfully."}
+        resp.media = {"message": f"Flow '{flow_id}' triggered."}
 
 
     def handle_interactive_message(self, user_id: str, message: Dict, resp: falcon.Response) -> None:
@@ -118,34 +137,49 @@ class WhatsAppWebhook:
         interactive_type = interactive.get("type", "")
 
         if interactive_type == "nfm_reply":
+            resp.status = falcon.HTTP_200
             return
 
-        elif interactive_type not in ["list_reply", "button_reply"]:
-            logger.warning(f"Unsupported interactive type: {interactive_type}, user: {user_id}")
-            send_text_message(user_id, "Unsupported interactive type. Please try again.")
+        if interactive_type not in ["list_reply", "button_reply"]:
+            logger.warning(f"Unsupported interactive type '{interactive_type}' from '{user_id}'.")
+            send_text_message(user_id, "Unsupported response type. Please try again.")
+            resp.status = falcon.HTTP_200
             resp.media = {"message": "Unsupported interactive type."}
             return
 
-        reply_id = interactive.get(interactive_type, {}).get("id", "").lower()
+        reply_id    = interactive.get(interactive_type, {}).get("id", "").lower()
         reply_title = interactive.get(interactive_type, {}).get("title", "")
 
-        fresh_flow = global_registry.get_flow_by_trigger(reply_id)
-        resume_from_step = temp_registry.get_user_current_step(user_id)
-        flow_id = temp_registry.get_user_current_flow(user_id)
-        
-        if fresh_flow:
-            resume_from_step = {}
-            temp_registry.clear_user_state(user_id)
-            flow_id = fresh_flow["id"]
-            logger.info(f"Triggering flow: {flow_id} for user: {user_id}")
+        fresh_flow        = global_registry.get_flow_by_trigger(reply_id)
+        resume_from_step  = temp_registry.get_user_current_step(user_id)
+        flow_id           = temp_registry.get_user_current_flow(user_id)
+        has_pending       = temp_registry.user_has_pending_step(user_id)
 
-        if not flow_id:
-            logger.warning(f"No flow found for trigger: {reply_id}, user: {user_id}")
-            send_text_message(user_id, "Sorry, no matching flow found. Please try again.")
+        if fresh_flow:
+            if flow_id:
+                logger.info(f"User '{user_id}' triggered new flow '{fresh_flow['id']}' via reply.")
+            temp_registry.clear_user_state(user_id)
+            resume_from_step = {}
+            flow_id = fresh_flow["id"]
+
+        elif not has_pending:
+            # Stale button click — no active session waiting for this reply
+            logger.warning(f"Stale interactive reply '{reply_id}' from '{user_id}' — no pending step.")
+            send_text_message(
+                user_id,
+                "This option is no longer active. Type /help to start a new conversation."
+            )
             resp.status = falcon.HTTP_200
-            resp.media = {"message": "No matching flow found."}
+            resp.media = {"message": "Stale interactive reply ignored."}
             return
 
-        execute_flow(user_id, flow_id, resume_from_step,  {"id": reply_id, "value": reply_title})
+        if not flow_id:
+            logger.warning(f"No flow context for interactive reply '{reply_id}' from '{user_id}'.")
+            send_text_message(user_id, "I couldn't find your session. Type /help to start fresh.")
+            resp.status = falcon.HTTP_200
+            resp.media = {"message": "No flow context."}
+            return
+
+        execute_flow(user_id, flow_id, resume_from_step, {"id": reply_id, "value": reply_title})
         resp.status = falcon.HTTP_200
-        resp.media = {"message": f"Flow {flow_id} triggered successfully."}
+        resp.media = {"message": f"Flow '{flow_id}' resumed."}

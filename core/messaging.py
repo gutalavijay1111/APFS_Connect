@@ -21,67 +21,80 @@ log_manager = LogManager()
 logger = log_manager.get_logger("messages")
 
 
-def execute_flow(user_id: str, flow_id: str, start_from_step: Optional[dict] = {}, user_response: dict = {}) -> None:
+_FLOW_ERROR = "__error__"   # sentinel returned by execute_step on failure
 
-    try: 
+
+def execute_flow(user_id: str, flow_id: str, start_from_step: Optional[dict] = {}, user_response: dict = {}) -> None:
+    try:
         from setup import global_registry, temp_registry
 
         if not (user_id and flow_id):
             logger.error(f"Invalid flow execution request: flow='{flow_id}', user='{user_id}'")
             return
 
-        # Check for pending step
-        user_state = temp_registry.get_user_state(user_id)
         flow = global_registry.flows.get(flow_id, {})
         if not flow:
-            logger.error(f"Flow with ID '{flow_id}' not found!")
+            logger.error(f"Flow '{flow_id}' not found.")
+            send_text_message(user_id, "⚠️ Flow not found. Type /help to see what's available.")
             return
 
         if not flow.get("is_active", False):
-            logger.warning(f"Flow '{flow_id}' is inactive. Skipping execution.")
+            logger.warning(f"Flow '{flow_id}' is inactive.")
+            send_text_message(user_id, "This feature is currently unavailable. Type /help for options.")
             return
 
-        current_step_id = start_from_step.get("id") or flow.get("start")
+        current_step_id = (start_from_step or {}).get("id") or flow.get("start")
         if not current_step_id:
-            logger.error(f"Flow '{flow_id}' does not have a start step defined!")
+            logger.error(f"Flow '{flow_id}' has no start step.")
             return
 
-        while current_step_id:
-
+        # Iterative loop — avoids recursion for next_flow chains
+        while flow_id and current_step_id:
             steps_visited = temp_registry.get_user_visited_steps(user_id)
             if current_step_id in steps_visited:
-                logger.error(f"Cycle detected in flow '{flow_id}' at step '{current_step_id}'. Aborting execution.")
+                logger.error(f"Cycle detected in flow '{flow_id}' at step '{current_step_id}'. Aborting.")
                 temp_registry.clear_user_state(user_id)
+                send_text_message(user_id, "⚠️ An error occurred. Please try again.")
                 return
 
-            # Retrieve the step from temp_registry if available
+            # Prefer stored pending step (has wait=False mutation applied); fall back to registry
             user_state = temp_registry.get_user_state(user_id)
-            current_step = user_state.get("current_step") if user_state else ""
-            if not current_step:
-                current_step = global_registry.get_step_by_id(flow_id, current_step_id)
+            current_step = user_state.get("current_step") or global_registry.get_step_by_id(flow_id, current_step_id)
 
             if not current_step or not current_step.get("is_active", False):
-                logger.error(f"Step '{current_step_id}' is invalid or inactive. Skipping.")
+                logger.error(f"Step '{current_step_id}' in flow '{flow_id}' is missing or inactive.")
+                temp_registry.clear_user_state(user_id)
                 break
 
             logger.info(f"Executing step '{current_step_id}' in flow '{flow_id}' for user '{user_id}'.")
-
             next_step_id = execute_step(flow_id, current_step, user_id, user_response)
+
             if next_step_id == "wait":
                 return
 
+            if next_step_id == _FLOW_ERROR:
+                # execute_step already cleared state and notified the user
+                return
+
             if not next_step_id:
+                # Current flow complete — check for a chained flow
                 next_flow_id = flow.get("next_flow")
                 if next_flow_id:
-                    flow_id = next_flow_id
-                    logger.info(f"Flow '{flow_id}' completed. Loading next flow '{next_flow_id}' for user '{user_id}'.")
+                    logger.info(f"Flow '{flow_id}' complete, chaining to '{next_flow_id}' for '{user_id}'.")
                     temp_registry.handle_user_flow_completion(user_id, next_flow_id)
-                    execute_flow(user_id, next_flow_id)
+                    flow = global_registry.flows.get(next_flow_id, {})
+                    if not flow or not flow.get("is_active", False):
+                        logger.error(f"Chained flow '{next_flow_id}' not found or inactive.")
+                        temp_registry.clear_user_state(user_id)
+                        break
+                    flow_id = next_flow_id
+                    current_step_id = flow.get("start")
+                    user_response = {}
+                    continue
                 else:
-                    logger.info(f"Flow '{flow_id}' completed for user '{user_id}'. Clearing state.")
+                    logger.info(f"Flow '{flow_id}' complete for '{user_id}'.")
                     temp_registry.clear_user_state(user_id)
                 break
-
 
             next_step = global_registry.get_step_by_id(flow_id, next_step_id)
             temp_registry.update_user_step(user_id, next_step)
@@ -89,63 +102,58 @@ def execute_flow(user_id: str, flow_id: str, start_from_step: Optional[dict] = {
             current_step_id = next_step_id
 
     except Exception as e:
-        logger.error(f"Faield to execute flow Error: {e}")
+        logger.error(f"Unexpected error in execute_flow: {e}")
+        try:
+            from setup import temp_registry
+            temp_registry.clear_user_state(user_id)
+            send_text_message(user_id, "⚠️ Something went wrong. Please try again or type /help.")
+        except Exception:
+            pass
 
 
 def execute_step(flow_id: str, step: dict, user_id: str, user_response: dict = {}) -> Optional[str]:
     import time
     from setup import temp_registry
 
+    step_id = step.get("id", "?")
     try:
-        processor_index = 0
-        user_state = temp_registry.get_user_state(user_id)
         user_has_pending_step = temp_registry.user_has_pending_step(user_id)
-        if user_state and user_state.get("id", "") == step["id"]:
+        processor_index = 0
+        if user_has_pending_step:
+            user_state = temp_registry.get_user_state(user_id)
             processor_index = user_state.get("processor_index", 0)
 
         if not user_has_pending_step:
-            # Pre-processors
-            pre_processors = step.get("pre_processors", [])
-            for pre_processor in pre_processors:
+            for pre_processor in step.get("pre_processors", []):
                 run_processor(flow_id, pre_processor, user_id, user_response)
+            handle_content(step.get("content", {}), user_id)
 
-            # Handle Content
-            content = step.get("content", {})
-            handle_content(content, user_id)
-
-        # Main Processors
         processors = step.get("processor", [])
         for idx, processor in enumerate(processors[processor_index:], start=processor_index):
             if processor.get("wait", False):
-                # Save the current state and return "wait" to stop execution
-                logger.info(f"Step '{step['id']}' paused for user '{user_id}' at processor index {idx}.")
+                logger.info(f"Step '{step_id}' waiting for user input (processor {idx}).")
                 temp_registry.update_user_step_as_pending(user_id, flow_id, step, processor_index=idx)
                 return "wait"
             run_processor(flow_id, processor, user_id, user_response)
 
-        # Clear pending state for this step after all processors are executed
         temp_registry.clear_user_pending_step(user_id)
 
-        # Post-processors
-        post_processors = step.get("post_processors", [])
-        for post_processor in post_processors:
+        for post_processor in step.get("post_processors", []):
             run_processor(flow_id, post_processor, user_id, user_response)
             time.sleep(2)
-
-        # On Success
-        on_success = step.get("on_success")
-        if on_success:
-            logger.info(f"Step '{step['id']}' succeeded: {on_success}")
 
         return step.get("next_step")
 
     except Exception as e:
-        # On Fail
-        on_fail = step.get("on_fail")
-        if on_fail:
-            logger.error(f"Step '{step['id']}' failed: {on_fail}")
-        logger.error(f"Error executing step '{step['id']}': {e}")
-        return None
+        on_fail_msg = step.get("on_fail")
+        logger.error(f"Step '{step_id}' in flow '{flow_id}' failed: {e}" +
+                     (f" (on_fail: {on_fail_msg})" if on_fail_msg else ""))
+        try:
+            temp_registry.clear_user_state(user_id)
+            send_text_message(user_id, "⚠️ Something went wrong. Please try again or type /help.")
+        except Exception:
+            pass
+        return _FLOW_ERROR
 
 
 
@@ -206,27 +214,26 @@ def send_interactive_message(phone_number: str, interactive_content: Dict) -> No
     send_message(payload)
 
 def send_message(payload: Dict) -> None:
+    from channels import get_channel
+    phone_number = payload.get("to", "")
     try:
-        phone_number = payload.get("to", "")
-        response: requests.Response = requests.post(
-            BASE_URL, headers=HEADERS, json=payload
-        )
-        response.raise_for_status()
+        get_channel().send(payload)
         log_conversation(phone_number, {"type": "text", "content": payload, "direction": "outgoing"})
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to send message: {e} Error: {response.content}")
+    except Exception as e:
+        logger.error(f"Failed to send message to {phone_number}: {e}")
 
 def log_conversation(phone_number, message_details):
     from setup import temp_registry
 
     user_state = temp_registry.get_user_state(phone_number)
     current_campaign_job = user_state.get("campaign_job_id")
-    MESSAGE_DUMP_DIR = os.getenv("MESSAGE_DUMP_DIR", "")
+    MESSAGE_DUMP_DIR = os.getenv("MESSAGE_DUMP_DIR", "logs/conversations")
+    os.makedirs(MESSAGE_DUMP_DIR, exist_ok=True)
 
     if not current_campaign_job:
-        with open(f"{MESSAGE_DUMP_DIR}/{phone_number}.json", "a") as file:
+        with open(os.path.join(MESSAGE_DUMP_DIR, f"{phone_number}.json"), "a") as file:
             file.write(json.dumps(message_details) + "\n")
-            return 
+            return
 
     with get_db() as db:  
         metadata = db.query(CampaignUserConversationMetadata).filter(
@@ -261,42 +268,56 @@ def log_conversation(phone_number, message_details):
 def run_processor(
     flow_id: str, processor_data: Dict, user_id: str, user_response: Optional[Dict] = None
 ) -> None:
-    
-    # Processors precedence:
-    # 1. script
-    # 2. Flow processor (Processer as function in {flow_id}.py)
-    # 3. Global processor (Processor as function) in processor.py
+    """
+    Resolve and execute a processor. Raises on failure so execute_step can handle it.
 
-    try:
-        from setup import global_registry
+    Lookup order:
+      1. Inline script  (.py filename)
+      2. Flow-specific  (processors/{flow_id}.py)
+      3. Global         (processors/processors.py)
+    """
+    import importlib
+    from setup import global_registry
 
-        processor_name = processor_data.get("name", "")
-        payload_template = processor_data.get("payload_template", {"user_response": "{{user_response}}"})
-        payload = format_template(payload_template, user_response)
-        payload["user_id"] = user_id
+    processor_name = processor_data.get("name", "")
+    if not processor_name:
+        return
 
-        if isinstance(processor_name, str) and processor_name.endswith(".py"):
-            logger.info(f"Executing processor:{processor_name} as script'")
-            execute_processor_script(processor_executor, payload)
+    payload_template = processor_data.get("payload_template", {"user_response": "{{user_response}}"})
+    payload = format_template(payload_template, user_response)
+    payload["user_id"] = user_id
 
-        flow_processor_mapping = json.loads(global_registry.flow_processors.get(flow_id))
-        processor_executor = flow_processor_mapping.get(processor_name)
-        if not processor_executor:
-            processor_executor = global_registry.get_processor_by_name(processor_name)
-            # processor_executor = global_registry.processors.get(processor_name)
+    # 1. Script-based processor
+    if processor_name.endswith(".py"):
+        logger.info(f"Executing processor '{processor_name}' as script.")
+        execute_processor_script(processor_name, payload)
+        return
 
-        if not processor_executor:
-            logger.warning(f"Processor '{processor_name}' not found!")
-            return
+    executor = _resolve_processor(flow_id, processor_name, global_registry, importlib)
+    if executor is None:
+        raise RuntimeError(f"Processor '{processor_name}' not found for flow '{flow_id}'.")
 
-        if callable(processor_executor):
-            logger.info(f"Executing processor: {processor_name} as function with payload: {payload}")
-            processor_executor(payload)
-        else:
-            logger.error(f"Processor '{processor_name}' has an invalid executor.")
+    logger.info(f"Executing processor '{processor_name}' for user '{user_id}'.")
+    executor(payload)
 
-    except Exception as e:
-        logger.error(f"Error executing processor '{processor_name}': {e}")
+
+def _resolve_processor(flow_id: str, name: str, global_registry, importlib) -> Optional[callable]:
+    """Return a callable for the named processor, or None if not found."""
+    # Flow-specific lookup
+    raw = global_registry.flow_processors.get(flow_id)
+    if raw:
+        flow_map = json.loads(raw)
+        ref = flow_map.get(name)
+        if ref:
+            mod_name, func_name = ref.rsplit(".", 1)
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, func_name, None)
+            if fn and callable(fn):
+                return fn
+            logger.warning(f"Flow processor ref '{ref}' is not callable; falling back to global.")
+
+    # Global lookup
+    return global_registry.get_processor_by_name(name)
 
 
 def execute_processor_script(script_path: str, payload: Dict[str, Any]) -> None:
